@@ -1,0 +1,1083 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+//
+// Enterprise Remote Browser Work Platform — complete schema.
+//
+// Notes:
+// - Datasource: SQLite (existing). All JSON-like columns are stored as String
+//   because SQLite does not natively support a Json type in Prisma.
+// - IDs use cuid() for globally-unique, collision-resistant identifiers.
+// - Numeric precision fields (CPU / memory / disk / latency / quota / traffic)
+//   use Float to honor the 0.001 granularity requirement.
+// - Every business table carries a soft-delete column `deletedAt DateTime?`.
+//   Append-only tables (AuditLog, ApiTokenCallLog, ProxyUsage, ConfigVersion,
+//   ScheduleTaskLog, SecurityAuditLog, LoginAttempt, RecycleBin) intentionally
+//   do NOT carry deletedAt — they must remain immutable history.
+// - AuditLog is APPEND-ONLY: never UPDATE or DELETE rows. Enforced at the
+//   application layer; SQLite has no native append-only table constraint.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// CORE IDENTITY
+// ============================================================
+
+model User {
+  id            String  @id @default(cuid())
+  // Identity
+  username      String  @unique
+  email         String  @unique
+  displayName   String?
+  avatar        String?
+  emailVerified Boolean @default(false)
+
+  // Auth
+  passwordHash        String? // bcrypt hash (mirror of PasswordCredential.hash for direct lookup)
+  role                String    @default("user") // superadmin | admin | user
+  status              String    @default("active") // active | suspended | disabled
+  mustChangePassword  Boolean   @default(false) // admin can force a password change on next login
+  twoFactorEnabled    Boolean   @default(false)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  // Login tracking
+  lastLoginAt DateTime?
+  lastLoginIp String?
+
+  // Arbitrary JSON preferences (UI theme, default workspace, etc.) — stored as JSON-encoded String
+  preferences String?
+
+  // Lifecycle
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // Primary group (legacy single-group binding)
+  groupId String?
+  group   UserGroup? @relation("UserPrimaryGroup", fields: [groupId], references: [id])
+
+  // ---- Existing security relations (kept intact) ----
+  password          PasswordCredential?
+  twoFactor         TwoFactorSecret?
+  backupCodes       TwoFactorBackupCode[]
+  trustedDevices    TrustedDevice[]
+  sessions          Session[]
+  securityAuditLogs SecurityAuditLog[]
+  apiTokens         ApiToken[]
+  emailCodes        EmailVerificationCode[]
+  emailTokens       EmailVerificationToken[]
+  resetTokens       PasswordResetToken[]
+  loginAttempts     LoginAttempt[]
+  changeEmail       ChangeEmailRequest?
+
+  // ---- Platform relations ----
+  groupMemberships   GroupUser[]
+  groupAdmins        GroupAdmin[]
+  refreshTokens      RefreshToken[]
+  operatedAuditLogs  AuditLog[]               @relation("UserOperatedAuditLogs")
+  fileMetas          FileMeta[]
+  handledAlerts      Alert[]                  @relation("UserHandledAlerts")
+  notices            Notice[]
+  browserWorkspaces  BrowserWorkspace[]
+  ownedTemplates     BrowserTemplate[]        @relation("BrowserTemplateOwner")
+  profileSnapshots   BrowserProfileSnapshot[] @relation("UserOwnedProfileSnapshots")
+  deletedRecycleBins RecycleBin[]             @relation("UserDeletedRecycleBins")
+  configVersions     ConfigVersion[]
+  workspaceShares    WorkspaceShare[]
+
+  @@index([status])
+  @@index([role])
+  @@index([deletedAt])
+}
+
+model UserGroup {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  description String?
+  // Hierarchy: a group may have a parent group (for nested org structures).
+  parentId    String?
+  parent      UserGroup?  @relation("GroupHierarchy", fields: [parentId], references: [id])
+  children    UserGroup[] @relation("GroupHierarchy")
+
+  // State
+  enabled                Boolean @default(true)
+  enforceTwoFactor       Boolean @default(false)
+  inheritGlobalTwoFactor Boolean @default(true)
+
+  // Quota JSON — e.g. { "maxSessions": 10, "maxCpu": 4.0 }
+  quota String?
+
+  // JSON array of user-ids who administer this group (group-scoped RBAC).
+  // Used by rbac.ts isGroupAdmin(). Set via admin UI.
+  admins String?
+
+  // Soft delete
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // Relations
+  users             User[]             @relation("UserPrimaryGroup")
+  groupUsers        GroupUser[]
+  groupAdmins       GroupAdmin[]
+  proxyNodes        ProxyNode[]
+  browserWorkspaces BrowserWorkspace[]
+  browserTemplates  BrowserTemplate[]  @relation("GroupOwnedTemplates")
+  webhookRules      WebhookRule[]
+
+  @@index([parentId])
+  @@index([enabled])
+  @@index([deletedAt])
+}
+
+// Many-to-many join: a user may belong to multiple groups with a per-group role.
+model GroupUser {
+  id        String   @id @default(cuid())
+  groupId   String
+  userId    String
+  role      String   @default("member") // owner | admin | member
+  createdAt DateTime @default(now())
+
+  group UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@index([groupId])
+}
+
+// Group administrators — separate from GroupUser to allow fine-grained admin perms.
+model GroupAdmin {
+  id           String   @id @default(cuid())
+  groupId      String
+  userId       String
+  canEditQuota Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  group UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@index([groupId])
+}
+
+// ============================================================
+// REFRESH TOKENS (JWT refresh flow)
+// ============================================================
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // sha256 hash of the refresh token
+  expiresAt DateTime
+  revokedAt DateTime? // null = active; set when explicitly revoked or rotated
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+// ============================================================
+// CREDENTIALS (kept from existing module)
+// ============================================================
+
+model PasswordCredential {
+  id         String            @id @default(cuid())
+  userId     String            @unique
+  hash       String // bcrypt hash, never plain text
+  changedAt  DateTime          @default(now())
+  mustChange Boolean           @default(false) // admin can force a password change on next login
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  history    PasswordHistory[]
+
+  @@index([userId])
+}
+
+model PasswordHistory {
+  id           String             @id @default(cuid())
+  credentialId String
+  hash         String // previous bcrypt hash
+  changedAt    DateTime           @default(now())
+  credential   PasswordCredential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+
+  @@index([credentialId])
+}
+
+model EmailVerificationCode {
+  id        String   @id @default(cuid())
+  userId    String?
+  email     String
+  code      String // 6-digit code (compared with constant-time)
+  purpose   String // login | register | forgot-password | change-email
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([email, purpose])
+  @@index([userId])
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  email     String
+  purpose   String // register-activate
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model ChangeEmailRequest {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  newEmail         String
+  oldEmailCode     String
+  newEmailCode     String
+  oldEmailVerified Boolean  @default(false)
+  newEmailVerified Boolean  @default(false)
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================
+// TWO-FACTOR AUTHENTICATION (kept from existing module)
+// ============================================================
+
+model TwoFactorSecret {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  encryptedSecret String
+  iv              String
+  tag             String
+  enabledAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model TwoFactorBackupCode {
+  id        String    @id @default(cuid())
+  userId    String
+  codeHash  String
+  used      Boolean   @default(false)
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model TrustedDevice {
+  id        String   @id @default(cuid())
+  userId    String
+  deviceId  String
+  label     String?
+  userAgent String
+  ipAddress String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+}
+
+// ============================================================
+// SESSION MANAGEMENT (kept from existing module)
+// ============================================================
+
+model Session {
+  id           String    @id @default(cuid())
+  userId       String
+  tokenHash    String    @unique
+  deviceLabel  String?
+  userAgent    String
+  ipAddress    String
+  isTrusted    Boolean   @default(false)
+  remember     Boolean   @default(false)
+  expiresAt    DateTime
+  lastActiveAt DateTime  @default(now())
+  createdAt    DateTime  @default(now())
+  revokedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ============================================================
+// AUDIT LOGS — APPEND-ONLY
+// ============================================================
+
+// IMPORTANT: AuditLog is APPEND-ONLY.
+// Application code MUST NEVER issue prisma.auditLog.update() or prisma.auditLog.delete().
+// This is the system-wide business audit log covering all mutations.
+model AuditLog {
+  id             String   @id @default(cuid())
+  traceId        String? // distributed-trace correlation id (UUID)
+  operatorUserId String? // null for system / cron operations
+  operatorName   String // denormalized name (survives user deletion)
+  operationType  String // create | update | delete | login | logout | export | ...
+  resourceType   String // user | workspace | proxy | singbox | config | ...
+  resourceId     String? // id of the affected resource
+  clientIp       String?
+  beforeJson     String? // JSON snapshot before mutation
+  afterJson      String? // JSON snapshot after mutation
+  createdAt      DateTime @default(now())
+
+  operator User? @relation("UserOperatedAuditLogs", fields: [operatorUserId], references: [id], onDelete: SetNull)
+
+  @@index([operatorUserId, createdAt])
+  @@index([resourceType, resourceId])
+  @@index([operationType])
+  @@index([createdAt])
+  @@index([traceId])
+}
+
+// Existing security-specific audit log (auth events). Kept intact.
+model SecurityAuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  actorId   String?
+  eventType String // login_success | login_failed | password_change | 2fa_enable | ...
+  severity  String   @default("info") // info | warning | critical
+  ipAddress String?
+  userAgent String?
+  metadata  String? // JSON string of extra details
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+model LoginAttempt {
+  id         String   @id @default(cuid())
+  userId     String?
+  identifier String
+  success    Boolean
+  reason     String?
+  ipAddress  String
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([identifier, createdAt])
+  @@index([ipAddress, createdAt])
+}
+
+// ============================================================
+// API TOKENS (for MCP / OpenAPI / external calls)
+// ============================================================
+
+model ApiToken {
+  id          String    @id @default(cuid())
+  userId      String
+  name        String
+  tokenHash   String    @unique // sha256 hash of the actual token
+  prefix      String // first 8 chars for display (e.g. "zplat_abc")
+  scopes      String? // JSON array of scope strings
+  ipWhitelist String? // JSON array of allowed CIDRs / IPs
+  permissions Int       @default(0) // bitmask of permission flags
+  enabled     Boolean   @default(true)
+  expireAt    DateTime? // null = no expiry
+  lastUsedAt  DateTime?
+  totalCalls  Int       @default(0)
+  createdAt   DateTime  @default(now())
+  deletedAt   DateTime? // soft-delete (revoked)
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  callLogs ApiTokenCallLog[]
+
+  @@index([userId])
+  @@index([enabled])
+  @@index([deletedAt])
+  @@index([expireAt])
+}
+
+// Per-call log for API tokens. APPEND-ONLY.
+model ApiTokenCallLog {
+  id         String   @id @default(cuid())
+  tokenId    String
+  path       String // route path that was hit
+  status     Int // HTTP status code
+  durationMs Int // request duration in ms
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  token ApiToken @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@index([tokenId, createdAt])
+  @@index([createdAt])
+  @@index([status])
+}
+
+// ============================================================
+// SYSTEM CONFIG (key-value with version history)
+// ============================================================
+
+model SystemConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique // e.g. "security.passwordPolicy.minLength"
+  valueJson   String // JSON-encoded value (any serializable)
+  category    String // security | branding | network | quota | ...
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  versions ConfigVersion[]
+
+  @@index([category])
+}
+
+// APPEND-ONLY history of every change to a SystemConfig row.
+model ConfigVersion {
+  id             String   @id @default(cuid())
+  configKey      String? // nullable so SystemConfig deletion preserves history
+  beforeJson     String? // JSON snapshot before change
+  afterJson      String? // JSON snapshot after change
+  operatorUserId String?
+  createdAt      DateTime @default(now())
+
+  config   SystemConfig? @relation(fields: [configKey], references: [key], onDelete: SetNull)
+  operator User?         @relation(fields: [operatorUserId], references: [id], onDelete: SetNull)
+
+  @@index([configKey, createdAt])
+  @@index([operatorUserId])
+  @@index([createdAt])
+}
+
+// ============================================================
+// GLOBAL SECURITY SETTINGS (singleton row) — kept from existing module
+// ============================================================
+
+model SecuritySettings {
+  id                               String   @id @default("singleton")
+  allowRegistration                Boolean  @default(true)
+  requireEmailActivation           Boolean  @default(true)
+  // password policy
+  passwordMinLength                Int      @default(8)
+  passwordRequireUppercase         Boolean  @default(true)
+  passwordRequireLowercase         Boolean  @default(true)
+  passwordRequireDigit             Boolean  @default(true)
+  passwordRequireSpecial           Boolean  @default(true)
+  passwordBlockWeakDictionary      Boolean  @default(true)
+  // lockout
+  maxFailedLoginAttempts           Int      @default(5)
+  lockoutDurationMinutes           Int      @default(15)
+  // email code
+  emailCodeTtlMinutes              Int      @default(5)
+  emailCodeSendIntervalSeconds     Int      @default(60)
+  emailCodeMaxPerHour              Int      @default(10)
+  // session
+  sessionMaxLifetimeHours          Int      @default(24)
+  sessionIdleTimeoutMinutes        Int      @default(60)
+  rememberSessionDays              Int      @default(30)
+  // 2FA
+  globalEnforceTwoFactor           Boolean  @default(false)
+  allowEmailCodeLogin              Boolean  @default(true)
+  // trusted device
+  trustedDeviceDays                Int      @default(30)
+  // account security change -> auto revoke API tokens
+  autoRevokeTokensOnSecurityChange Boolean  @default(false)
+  // anomaly alerts
+  enableAnomalyAlert               Boolean  @default(true)
+  // password expiry
+  passwordExpiryDays               Int      @default(0)
+  passwordExpiryWarningDays        Int      @default(7)
+  // prevent password reuse
+  passwordHistoryCount             Int      @default(0)
+  // graphic captcha
+  enableLoginCaptcha               Boolean  @default(true)
+  updatedAt                        DateTime @updatedAt
+}
+
+// ============================================================
+// RISK RULE ENGINE — kept from existing module
+// ============================================================
+
+model RiskRule {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  conditions  String // JSON: { eventType, threshold, windowMinutes, newGeo, newDevice, severity }
+  action      String // lock_account | force_logout | disable_account | alert_only | force_password_change
+  enabled     Boolean   @default(true)
+  fireCount   Int       @default(0)
+  lastFiredAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([enabled])
+}
+
+model RiskEvent {
+  id        String   @id @default(cuid())
+  ruleId    String?
+  userId    String?
+  ruleName  String
+  action    String
+  detail    String
+  ipAddress String?
+  resolved  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@index([resolved])
+}
+
+// ============================================================
+// SCHEDULED TASKS (cron-driven background jobs)
+// ============================================================
+
+model ScheduleTask {
+  id                  String    @id @default(cuid())
+  name                String    @unique
+  cronExpr            String // e.g. "*/5 * * * *"
+  enabled             Boolean   @default(true)
+  lastExecuteAt       DateTime?
+  nextExecuteAt       DateTime?
+  lastResult          String? // JSON or short status string
+  lastError           String?
+  consecutiveFailures Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  logs ScheduleTaskLog[]
+
+  @@index([enabled])
+  @@index([nextExecuteAt])
+}
+
+// APPEND-ONLY execution log per scheduled task.
+model ScheduleTaskLog {
+  id         String    @id @default(cuid())
+  taskId     String
+  startedAt  DateTime
+  finishedAt DateTime?
+  result     String? // JSON or short status string
+  errorStack String? // full error stack trace if failed
+
+  task ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, startedAt])
+  @@index([startedAt])
+}
+
+// ============================================================
+// FILE METADATA
+// ============================================================
+
+model FileMeta {
+  id         String    @id @default(cuid())
+  name       String // original file name
+  storageKey String // object storage key / local path
+  size       Int // bytes
+  mime       String
+  userId     String?
+  sessionId  String? // browser workspace session id (string FK, no enforced relation)
+  expireAt   DateTime? // auto-purge time
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([expireAt])
+  @@index([deletedAt])
+}
+
+// ============================================================
+// ALERTS & NOTICES
+// ============================================================
+
+model Alert {
+  id           String    @id @default(cuid())
+  title        String
+  level        String    @default("info") // info | warning | critical
+  content      String? // human-readable alert body
+  resourceId   String?
+  resourceType String? // user | workspace | proxy | singbox | host | ...
+  triggerAt    DateTime  @default(now()) // when condition fired
+  handleStatus String    @default("pending") // pending | handled | ignored
+  handledBy    String?
+  handledAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  handler User? @relation("UserHandledAlerts", fields: [handledBy], references: [id], onDelete: SetNull)
+
+  @@index([level])
+  @@index([handleStatus])
+  @@index([resourceType, resourceId])
+  @@index([triggerAt])
+  @@index([handledBy])
+}
+
+model AlertRule {
+  id         String   @id @default(cuid())
+  name       String
+  conditions String // JSON: { metric, op, threshold, windowMinutes }
+  level      String   @default("warning") // info | warning | critical
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([enabled])
+  @@index([level])
+}
+
+model Notice {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  content   String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@index([createdAt])
+}
+
+// ============================================================
+// RECYCLE BIN — soft-deleted resource snapshots for restore
+// NOTE: rows are appended on delete and physically purged after expiresAt.
+// ============================================================
+
+model RecycleBin {
+  id               String   @id @default(cuid())
+  resourceType     String // user | workspace | proxy | template | ...
+  resourceId       String
+  resourceSnapshot String // JSON snapshot of the resource at deletion time
+  deletedBy        String?
+  deletedAt        DateTime @default(now())
+  expiresAt        DateTime // physical purge time
+
+  deletedByUser User? @relation("UserDeletedRecycleBins", fields: [deletedBy], references: [id], onDelete: SetNull)
+
+  @@index([resourceType, resourceId])
+  @@index([deletedBy])
+  @@index([expiresAt])
+}
+
+// ============================================================
+// BROWSER WORKSPACE — Steel-Browser session container
+// ============================================================
+
+model BrowserWorkspace {
+  id                String  @id @default(cuid())
+  userId            String
+  groupId           String?
+  proxyNodeId       String?
+  singboxInstanceId String?
+  steelSessionId    String? // external Steel-Browser session id
+  novncSessionId    String? // NoVNC websockify session id (for novnc_full mode)
+  novncSecret       String? // NoVNC connection secret
+
+  name   String
+  tags   String? // JSON array of string tags
+  mode   String  @default("cdp_light") // cdp_light | novnc_full
+  status String  @default("creating") // creating | running | idle | stopped | error | expired
+
+  profileSnapshotId String?
+
+  ttlMinutes         Int @default(60) // hard lifetime
+  idleTimeoutMinutes Int @default(15) // auto-stop after N minutes idle
+
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // ---- Relations ----
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group           UserGroup?       @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  proxyNode       ProxyNode?       @relation(fields: [proxyNodeId], references: [id], onDelete: SetNull)
+  singboxInstance SingboxInstance? @relation(fields: [singboxInstanceId], references: [id], onDelete: SetNull)
+
+  // Current profile snapshot (1:1 or 1:0)
+  currentProfileSnapshot BrowserProfileSnapshot?  @relation("WorkspaceCurrentProfileSnapshot", fields: [profileSnapshotId], references: [id], onDelete: SetNull)
+  // All snapshots belonging to this workspace
+  profileSnapshots       BrowserProfileSnapshot[] @relation("ProfileSnapshotsOfWorkspace")
+
+  shares      WorkspaceShare[]
+  proxyUsages ProxyUsage[]
+
+  @@index([userId])
+  @@index([groupId])
+  @@index([proxyNodeId])
+  @@index([singboxInstanceId])
+  @@index([status])
+  @@index([mode])
+  @@index([deletedAt])
+  @@index([steelSessionId])
+  @@index([novncSessionId])
+}
+
+model BrowserTemplate {
+  id         String    @id @default(cuid())
+  name       String
+  visibility String    @default("private") // private | group | global
+  ownerId    String
+  groupId    String?
+  parentId   String? // template inheritance
+  config     String // JSON: { scripts, modifyRules, ua, proxy, ... }
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  owner       User                @relation("BrowserTemplateOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  group       UserGroup?          @relation("GroupOwnedTemplates", fields: [groupId], references: [id], onDelete: SetNull)
+  parent      BrowserTemplate?    @relation("TemplateInheritance", fields: [parentId], references: [id], onDelete: SetNull)
+  children    BrowserTemplate[]   @relation("TemplateInheritance")
+  modifyRules BrowserModifyRule[]
+
+  @@index([ownerId])
+  @@index([groupId])
+  @@index([parentId])
+  @@index([visibility])
+  @@index([deletedAt])
+}
+
+model BrowserProfileSnapshot {
+  id          String    @id @default(cuid())
+  userId      String?
+  workspaceId String?
+  name        String
+  storagePath String // path / key to the profile archive
+  size        Int // bytes
+  scope       String    @default("private") // private | group | global
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  user                User?              @relation("UserOwnedProfileSnapshots", fields: [userId], references: [id], onDelete: SetNull)
+  workspace           BrowserWorkspace?  @relation("ProfileSnapshotsOfWorkspace", fields: [workspaceId], references: [id], onDelete: SetNull)
+  // Workspaces that currently point to this snapshot
+  currentOfWorkspaces BrowserWorkspace[] @relation("WorkspaceCurrentProfileSnapshot")
+
+  @@index([userId])
+  @@index([workspaceId])
+  @@index([scope])
+  @@index([deletedAt])
+}
+
+model BrowserScriptTemplate {
+  id           String    @id @default(cuid())
+  name         String
+  sourceCode   String // user-script / injected JS
+  version      String
+  enabled      Boolean   @default(true)
+  boundDomains String? // JSON array of host patterns this script applies to
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([enabled])
+  @@index([name])
+  @@index([deletedAt])
+}
+
+model BrowserModifyRule {
+  id         String   @id @default(cuid())
+  name       String
+  type       String // request_header | response_header | redirect
+  pattern    String // URL match pattern
+  value      String // header value or redirect target
+  enabled    Boolean  @default(true)
+  templateId String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  template BrowserTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+  @@index([type])
+  @@index([enabled])
+}
+
+model WorkspaceShare {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  targetUserId String
+  permission   String    @default("readonly") // readonly | operable
+  expireAt     DateTime?
+  createdAt    DateTime  @default(now())
+
+  workspace  BrowserWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  targetUser User             @relation(fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, targetUserId])
+  @@index([targetUserId])
+  @@index([workspaceId])
+  @@index([expireAt])
+}
+
+// ============================================================
+// STEEL NODE — Steel-Browser cluster node
+// ============================================================
+
+model SteelNode {
+  id             String    @id @default(cuid())
+  name           String    @unique
+  apiBaseUrl     String // e.g. http://steel-1.internal:3000
+  label          String?
+  weight         Int       @default(1) // routing weight
+  status         String    @default("active") // active | draining | offline | error
+  activeSessions Int       @default(0)
+  lastHealthAt   DateTime?
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([status])
+  @@index([deletedAt])
+}
+
+// ============================================================
+// PROXY NODE & USAGE
+// ============================================================
+
+model ProxyNode {
+  id                String    @id @default(cuid())
+  name              String    @unique
+  type              String    @default("external") // external | internal_singbox
+  singboxInstanceId String? // populated when type = internal_singbox
+  socksAddress      String?
+  httpAddress       String?
+  status            String    @default("active") // active | draining | offline | error
+  healthLatency     Float? // ms — 0.001 granularity
+  tags              String? // JSON array of string tags
+  weight            Int       @default(1)
+  groupId           String?
+  deletedAt         DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  singboxInstance SingboxInstance? @relation(fields: [singboxInstanceId], references: [id], onDelete: SetNull)
+  group           UserGroup?       @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  workspaces BrowserWorkspace[]
+  usages     ProxyUsage[]
+
+  @@index([type])
+  @@index([status])
+  @@index([groupId])
+  @@index([singboxInstanceId])
+  @@index([deletedAt])
+}
+
+// APPEND-ONLY per-workspace proxy traffic accounting.
+model ProxyUsage {
+  id          String   @id @default(cuid())
+  proxyNodeId String
+  workspaceId String
+  bytesIn     Int      @default(0)
+  bytesOut    Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  proxyNode ProxyNode        @relation(fields: [proxyNodeId], references: [id], onDelete: Cascade)
+  workspace BrowserWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([proxyNodeId, createdAt])
+  @@index([workspaceId, createdAt])
+  @@index([createdAt])
+}
+
+// ============================================================
+// USER AGENT REGISTRY
+// ============================================================
+
+model UserAgent {
+  id        String   @id @default(cuid())
+  ua        String   @unique
+  label     String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([enabled])
+}
+
+// ============================================================
+// WEBHOOK RULES
+// ============================================================
+
+model WebhookRule {
+  id        String   @id @default(cuid())
+  name      String
+  url       String
+  secret    String? // HMAC signing secret
+  events    String // JSON array of event names to subscribe to
+  groupId   String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  group UserGroup? @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+  @@index([enabled])
+}
+
+// ============================================================
+// SING-BOX INSTANCE ORCHESTRATION
+// ============================================================
+
+model SingboxInstance {
+  id                String    @id @default(cuid())
+  name              String    @unique
+  description       String?
+  tags              String? // JSON array of string tags
+  cpuLimit          Float     @default(1.0) // cores — 0.001 granularity
+  memoryLimit       Float     @default(512.0) // MB — 0.001 granularity
+  dockerContainerId String?
+  status            String    @default("stopped") // creating | running | restarting | stopped | error
+  hostNodeId        String?
+  socksAddress      String?
+  configJson        String // current effective config
+  maxSessions       Int       @default(64)
+  trafficIn         Float     @default(0) // MB — 0.001 granularity
+  trafficOut        Float     @default(0) // MB — 0.001 granularity
+  deletedAt         DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  hostNode          HostNode?              @relation(fields: [hostNodeId], references: [id], onDelete: SetNull)
+  configVersions    SingboxConfigVersion[]
+  proxyNodes        ProxyNode[]
+  browserWorkspaces BrowserWorkspace[]
+
+  @@index([status])
+  @@index([hostNodeId])
+  @@index([deletedAt])
+}
+
+// APPEND-ONLY config history per Singbox instance.
+model SingboxConfigVersion {
+  id         String   @id @default(cuid())
+  instanceId String
+  configJson String // full config snapshot
+  createdAt  DateTime @default(now())
+
+  instance SingboxInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([instanceId, createdAt])
+  @@index([createdAt])
+}
+
+// ============================================================
+// HOST NODE — physical / VM host that runs Singbox containers
+// ============================================================
+
+model HostNode {
+  id           String    @id @default(cuid())
+  name         String    @unique
+  dockerApiUrl String // e.g. tcp://host:2376 or unix:///var/run/docker.sock
+  cpuTotal     Float     @default(0) // cores — 0.001 granularity
+  memoryTotal  Float     @default(0) // MB — 0.001 granularity
+  cpuUsed      Float     @default(0)
+  memoryUsed   Float     @default(0)
+  status       String    @default("active") // active | draining | offline | error
+  label        String?
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  singboxInstances SingboxInstance[]
+
+  @@index([status])
+  @@index([deletedAt])
+}
+
+// ============================================================
+// QUOTA — scope-aware resource caps
+// ============================================================
+// Quota rows are per (scope, scopeId, resource). hardLimit is the absolute
+// upper bound; reserved is a safety margin that must be kept free (effective
+// limit = hardLimit - reserved). Used by src/lib/quota.ts.
+
+model Quota {
+  id          String   @id @default(cuid())
+  scope       String // global | group | user
+  scopeId     String // "global" | <groupId> | <userId>
+  resource    String // browser_workspace | novnc_workspace | singbox_cpu | singbox_memory | storage_bytes | ...
+  hardLimit   Float    @default(0) // absolute upper bound — 0.001 granularity
+  reserved    Float    @default(0) // safety margin kept free — 0.001 granularity
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([scope, scopeId, resource])
+  @@index([scope])
+  @@index([scope, scopeId])
+}
+
+// Current usage counter for each (scope, scopeId, resource). Always paired
+// with a Quota row at the same key.
+model QuotaUsage {
+  id        String   @id @default(cuid())
+  scope     String // global | group | user
+  scopeId   String // "global" | <groupId> | <userId>
+  resource  String
+  used      Float    @default(0) // current consumption — 0.001 granularity
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scope, scopeId, resource])
+  @@index([scope])
+  @@index([scope, scopeId])
+}
+
+// ============================================================
+// LEGACY (kept for compatibility)
+// ============================================================
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String?
+  published Boolean  @default(false)
+  authorId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
