@@ -717,6 +717,10 @@ model BrowserWorkspace {
   novncSessionId    String? // NoVNC websockify session id (for novnc_full mode)
   novncSecret       String? // NoVNC connection secret
 
+  // Enterprise ownership tracking (per spec: createdByUserId + ownerUserId)
+  createdByUserId   String? // original creator — never changes
+  ownerUserId       String? // current owner — can be transferred
+
   name   String
   tags   String? // JSON array of string tags
   mode   String  @default("cdp_light") // cdp_light | novnc_full
@@ -969,6 +973,11 @@ model SingboxInstance {
   name              String    @unique
   description       String?
   tags              String? // JSON array of string tags
+
+  // Enterprise ownership tracking
+  createdByUserId   String?
+  ownerUserId       String?
+
   cpuLimit          Float     @default(1.0) // cores — 0.001 granularity
   memoryLimit       Float     @default(512.0) // MB — 0.001 granularity
   dockerContainerId String?
