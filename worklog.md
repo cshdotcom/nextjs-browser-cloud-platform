@@ -587,3 +587,40 @@ Stage Summary:
 - 平台 15 项导航 + 通知徽章 + 全局搜索 + CSV 导入全部可用
 - 演示账号：admin@zai.local / Admin@123456
 - 待后续：NoVNC WebSocket 代理、MCP 协议、VNC 魔改、Standalone 打包、统一网关、用户行为风控、脏数据自愈、灰度调度、流量统计等
+
+---
+Task ID: webDevReview-11
+Agent: orchestrator
+Task: GitHub 推送 + Docker 镜像 + 管理员强制管控 + 资源归属字段
+
+Work Log:
+- GitHub 仓库创建：https://github.com/cshdotcom/nextjs-browser-cloud-platform
+  - 完整源码推送（49 模型 + 91 API + 34 lib + 29 组件）
+  - 历史压缩清理（移除包含测试 token 的 spec 文档）
+- Docker 镜像构建支持：
+  - Dockerfile: multi-stage build (deps → build → runner), standalone output, dumb-init
+  - docker-entrypoint.sh: 自动 prisma db push + seed + 启动
+  - docker-compose.yml: host 网络模式, 可变 CDP_SERVER_PORT, Docker socket 挂载
+  - /api/health: 轻量级健康检查端点
+  - .dockerignore: 排除 dev 产物
+- 管理员强制实例管控 API (/api/admin/force-control)：
+  - requireSuperadmin 权限校验（仅超级管理员）
+  - 支持 workspace + singbox 两种资源类型
+  - 6 种强制操作：force_stop / force_restart / force_recycle / force_delete / force_disconnect_vnc / force_set_ttl
+  - force_delete: 绕过回收站直接物理删除（不可恢复）
+  - force_recycle: 进入回收站（遵循回收站策略）
+  - 全部操作记录 platformAudit 审计日志（操作管理员ID + 目标资源UUID + 归属用户ID）
+- 资源归属字段（企业级）：
+  - BrowserWorkspace: 增加 createdByUserId (原始创建人, 只读) + ownerUserId (当前所有者, 可转移)
+  - SingboxInstance: 同上
+  - db push 同步新字段
+- bun run lint 通过（0 errors）
+- /api/health 端点验证通过
+
+Stage Summary:
+- GitHub 仓库: https://github.com/cshdotcom/nextjs-browser-cloud-platform
+- Docker: host 模式 + 可变 CDP_SERVER_PORT + 自动初始化
+- 管理员强制管控: 6 种操作 + 审计日志 + 回收站联动
+- 资源归属: createdByUserId + ownerUserId 双字段（创建人/所有者分离）
+- 演示账号: admin@zai.local / Admin@123456
+- 待后续: 前端管理员强制操作按钮 + 资源归属列显示 + MCP 协议 + VNC 魔改 + IP 白名单/黑名单 + 16 项权限开关 + 资源定时生命周期 + Standalone 打包优化
