@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+dev.log
+server.log
+*.db
+*.db-journal
+upload/
+tool-results/
+screenshot-*.png
+storage/
+.zscripts/
+data/

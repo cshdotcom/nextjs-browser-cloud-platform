@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  browser-cloud-platform:
+    build: .
+    container_name: browser-cloud-platform
+    # host 网络模式 — 直接使用宿主机网络，无 NAT 隔离
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # NextJS 服务端口
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+      # CDP 服务端后台端口（可改变量改）
+      - CDP_SERVER_PORT=9222
+      # Steel-Browser API 地址（内网）
+      - STEEL_API_URL=http://127.0.0.1:9222
+      # Docker API（host 模式下直接访问宿主机 socket）
+      - DOCKER_API_URL=unix:///var/run/docker.sock
+      # 数据库
+      - DATABASE_URL=file:/app/db/custom.db
+      # 存储
+      - STORAGE_TYPE=local
+      - STORAGE_LOCAL_PATH=/app/storage
+      # 密钥（生产环境必须替换）
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me-32bytes000}
+      - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:-dev-encryption-key-change-me32}
+      - CAPTCHA_SECRET=${CAPTCHA_SECRET:-dev-captcha-secret-change-me-32byte}
+      - CRON_SECRET=${CRON_SECRET:-dev-cron-secret}
+    volumes:
+      # 数据库持久化
+      - ./data/db:/app/db
+      # 文件存储持久化
+      - ./data/storage:/app/storage
+      # Docker socket（host 模式下可选，用于容器编排）
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      # 即使 host 模式，也声明端口用于文档
+      - "3000:3000"
+      - "9222:9222"
